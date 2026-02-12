@@ -6,7 +6,8 @@ use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
 use nvml_wrapper::enums::device::UsedGpuMemory;
 use nvml_wrapper::Nvml;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 const MB: u64 = 1024 * 1024;
 
@@ -17,6 +18,10 @@ pub struct GpuProcessInfo {
     pub username: Option<String>,
     pub command: String,
     pub gpu_memory_usage: Option<u64>, // in MB
+    /// True when username/command were resolved via Ngid-to-PID mapping
+    pub username_from_ngid_mapping: bool,
+    /// Real host PID when resolved via Ngid mapping (original pid was Ngid)
+    pub real_pid: Option<u32>,
 }
 
 /// Single GPU statistics
@@ -95,51 +100,129 @@ impl GpuStatCollection {
     }
 }
 
-/// Get process info from PID (username, command)
-fn get_process_info(pid: u32) -> (Option<String>, String) {
+/// Build mapping from Ngid/NStgid to host PID by scanning /proc.
+/// On some systems, NVML returns Ngid instead of the real PID; this mapping
+/// allows us to resolve to the actual process.
+#[cfg(target_os = "linux")]
+fn build_ngid_to_pid_mapping() -> HashMap<u32, u32> {
+    let mut mapping = HashMap::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return mapping;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Ok(host_pid) = name.to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let status_path = entry.path().join("status");
+        let Ok(status) = std::fs::read_to_string(&status_path) else {
+            continue;
+        };
+
+        let mut ngid = None;
+        let mut nstgid_values = Vec::new();
+
+        for line in status.lines() {
+            if let Some(value) = line.strip_prefix("Ngid:") {
+                if let Ok(v) = value.trim().parse::<u32>() {
+                    ngid = Some(v);
+                }
+                break;
+            }
+        }
+        for line in status.lines() {
+            if let Some(value) = line.strip_prefix("NStgid:") {
+                for part in value.split_whitespace() {
+                    if let Ok(v) = part.parse::<u32>() {
+                        nstgid_values.push(v);
+                    }
+                }
+                break;
+            }
+        }
+
+        if let Some(ng) = ngid {
+            if ng != 0 {
+                mapping.insert(ng, host_pid);
+            }
+        }
+        for ns_pid in nstgid_values {
+            mapping.insert(ns_pid, host_pid);
+        }
+    }
+    mapping
+}
+
+/// Get process info from PID (username, command).
+/// When direct lookup fails (e.g. NVML returns Ngid instead of PID), retries
+/// using Ngid/NStgid-to-PID mapping.
+/// Returns (username, command, resolved_via_ngid_mapping, real_pid_when_mapped).
+fn get_process_info(pid: u32) -> (Option<String>, String, bool, Option<u32>) {
     #[cfg(target_os = "linux")]
     {
         use std::path::Path;
         use procfs::process::Process;
 
-        let process = match Process::new(pid as i32) {
-            Ok(p) => p,
-            Err(_) => return (None, "?".to_string()),
+        let try_lookup = |p: u32| -> (Option<String>, String) {
+            let process = match Process::new(p as i32) {
+                Ok(proc) => proc,
+                Err(_) => return (None, "?".to_string()),
+            };
+
+            let username = process
+                .uid()
+                .ok()
+                .and_then(|uid| users::get_user_by_uid(uid))
+                .and_then(|u| u.name().to_str().map(|s| s.to_string()));
+
+            let command = process
+                .cmdline()
+                .ok()
+                .and_then(|cmdline| {
+                    if cmdline.is_empty() {
+                        process.stat().ok().map(|s| s.comm.clone())
+                    } else {
+                        Some(
+                            Path::new(&cmdline[0])
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("?")
+                                .to_string(),
+                        )
+                    }
+                })
+                .unwrap_or_else(|| "?".to_string());
+
+            (username, command)
         };
 
-        // Get username from UID
-        let username = process
-            .uid()
-            .ok()
-            .and_then(|uid| users::get_user_by_uid(uid))
-            .and_then(|u| u.name().to_str().map(|s| s.to_string()));
+        static MAPPING: OnceLock<HashMap<u32, u32>> = OnceLock::new();
+        let mapping = MAPPING.get_or_init(build_ngid_to_pid_mapping);
 
-        // Get command from cmdline (basename of first arg) or stat.comm as fallback
-        let command = process
-            .cmdline()
-            .ok()
-            .and_then(|cmdline| {
-                if cmdline.is_empty() {
-                    process.stat().ok().map(|s| s.comm.clone())
-                } else {
-                    Some(
-                        Path::new(&cmdline[0])
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("?")
-                            .to_string(),
-                    )
+        // When mapping says pid -> real_pid and real_pid != pid, the NVML "pid" is Ngid/ns-pid.
+        // We must use the mapped result even if direct lookup "succeeded" (that would be a wrong
+        // process when Ngid happens to equal some unrelated host PID).
+        let mut result = try_lookup(pid);
+        let mut from_mapping = false;
+        let mut real_pid = None;
+        if let Some(&rp) = mapping.get(&pid) {
+            if rp != pid {
+                result = try_lookup(rp);
+                from_mapping = result.1 != "?";
+                if from_mapping {
+                    real_pid = Some(rp);
                 }
-            })
-            .unwrap_or_else(|| "?".to_string());
-
-        (username, command)
+            }
+        } else if result.1 == "?" {
+            // Not in mapping and direct failed - can't resolve
+        }
+        (result.0, result.1, from_mapping, real_pid)
     }
 
     #[cfg(not(target_os = "linux"))]
     {
         let _ = pid;
-        (None, "?".to_string())
+        (None, "?".to_string(), false, None)
     }
 }
 
@@ -199,13 +282,15 @@ fn get_gpu_info(nvml: &Nvml, index: u32) -> Result<GpuStat, nvml_wrapper::error:
                 UsedGpuMemory::Unavailable => None,
             };
 
-            let (username, command) = get_process_info(nv_process.pid);
+            let (username, command, username_from_ngid_mapping, real_pid) = get_process_info(nv_process.pid);
 
             processes.push(GpuProcessInfo {
                 pid: nv_process.pid,
                 username,
                 command,
                 gpu_memory_usage: gpu_memory_mb,
+                username_from_ngid_mapping,
+                real_pid,
             });
         }
         Some(processes)

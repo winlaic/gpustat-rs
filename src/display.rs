@@ -203,11 +203,17 @@ fn format_process(p: &GpuProcessInfo, opts: &DisplayOptions, use_color: bool) ->
     s.push(' ');
 
     // Python: CUser = term.bold_black (gray for username)
+    // Username resolved via Ngid mapping: green (.green() for terminal compatibility)
     let show_username = opts.show_user || !opts.show_cmd;
     if show_username {
         let username = p.username.as_deref().unwrap_or("--");
         if use_color {
-            s.push_str(&username.bright_black().to_string());
+            let username_str = if p.username_from_ngid_mapping {
+                username.green().to_string()
+            } else {
+                username.bright_black().to_string()
+            };
+            s.push_str(&username_str);
         } else {
             s.push_str(username);
         }
@@ -224,7 +230,11 @@ fn format_process(p: &GpuProcessInfo, opts: &DisplayOptions, use_color: bool) ->
         }
     }
     if opts.show_pid {
-        s.push_str(&format!("/{}", p.pid));
+        let pid_str = match p.real_pid {
+            Some(rp) => format!("{}->{}", p.pid, rp),
+            None => p.pid.to_string(),
+        };
+        s.push_str(&format!("/{}", pid_str));
     }
     let mem_str = match p.gpu_memory_usage {
         Some(m) => m.to_string(),
